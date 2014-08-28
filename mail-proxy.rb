@@ -4,6 +4,7 @@ require 'em-proxy'
 require 'em-http'
 require 'yaml'
 require 'net/http'
+require 'securerandom'
 
 class ClamAV < EventMachine::Connection
 
@@ -14,7 +15,25 @@ class ClamAV < EventMachine::Connection
   end
 
   def post_init
-    send_data "SCAN /tmp/test.mail"
+    send_data "zINSTREAM\0"
+    pos = 0
+    while @msg.size > pos
+      max = pos+1024
+      max = @msg.size if max > (@msg.size)
+p max-pos
+p @msg[pos..(max-1)].size
+      send_data [max-pos].pack("N")
+      send_data @msg[pos..(max-1)]
+      pos += 1024
+    end
+    if pos < @msg.size
+p @msg.size-pos
+p @msg[pos..(@msg.size-1)].size
+      send_data [@msg.size-pos].pack("N")
+      send_data @msg[pos..(@msg.size-1)]
+    end
+    send_data "\0\0\0\0"
+    send_data "\0"
   end
 
   def receive_data(data)
@@ -23,18 +42,21 @@ class ClamAV < EventMachine::Connection
 
   def unbind
     msg_new = ""
-    if @ret=~/^\/tmp\/test\.mail: (.+)$/
+    if @ret=~/^stream: (.+)\0$/
       state = $1
       if state == "OK"
         msg_new = "X-MailProxy-VC: Clean\r\n#{@msg}"
       else
-p "VIRUS"
+        File.open("quarantine/#{SecureRandom.uuid}.mail","w") do |f|
+          f.write("X-MailProxy-VC: Virus #{state}\r\n#{@msg}")
+        end
         @p_conn.send_data "250 2.0.0: Message accepted for delivery\r\n"
+        return
       end
     else
       msg_new = "X-MailProxy-VC: Unknown\r\n#{@msg}"
     end
-    @p_conn.relay_to_servers(msg_new) unless msg_new==""
+    EventMachine.connect '127.0.0.1', 3030, SpamC, msg_new, @p_conn
   end
 end
 
@@ -89,10 +111,7 @@ Proxy.start(:host => "0.0.0.0", :port => 2524) do |conn|
     if @done
       @buffer = false
       #p [:body_scan, @msg]
-      File.open("/tmp/test.mail","w") do |f|
-        f.write @msg
-      end
-      EventMachine.connect_unix_domain "/tmp/clamd.socket", ClamAV, @msg, conn
+      EventMachine.connect '127.0.0.1', 3310, ClamAV, @msg, conn
       #EventMachine.connect '127.0.0.1', 3030, SpamC, @msg, conn
       data = nil
     end
